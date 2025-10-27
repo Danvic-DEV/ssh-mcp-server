@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  ssh-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ssh-mcp-server
+    
+    # Expose port for HTTP server
+    ports:
+      - "8005:8000"
+    
+    # Load ALL variables from .env file (including host, user, password)
+    env_file:
+      - .env
+      
+    # Additional environment variables (optional if using env_file, but useful for debug)
+    environment:
+      # SSH variables
+      - SSH_HOST=${SSH_HOST}
+      - SSH_USER=${SSH_USER}
+      - SSH_PASSWORD=${SSH_PASSWORD}
+      - SSH_KEY_FILE=${SSH_KEY_FILE}
+      - SSH_PORT=${SSH_PORT}
+      # Server configuration
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8000
+
+    # Restart container in case of error
+    restart: unless-stopped
+    
+    # Network connections
+    networks:
+      - ssh-mcp-network
+      - backend
+
+networks:
+  ssh-mcp-network:
+    driver: bridge
+  backend:
+    external: true
+    name: llm-rag-mcp_backend
