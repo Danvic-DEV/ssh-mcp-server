@@ -10,10 +10,8 @@ import time
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 import uvicorn
-from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse
-from starlette.routing import Mount, Route
 
 from mcp.server.fastmcp import FastMCP
 from .ssh_client import SSHClient
@@ -37,30 +35,54 @@ CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 _pending_codes: Dict[str, Dict[str, Any]] = {}
 
 
-class BearerAuthMiddleware:
-    """Optional bearer auth middleware for all incoming HTTP requests."""
+class OAuthRouter:
+    """ASGI middleware that:
+    - Passes lifespan/websocket scopes directly to the inner FastMCP app so its
+      task group is properly initialised.
+    - Dispatches GET /authorize and POST /oauth/token without requiring a bearer
+      token (public OAuth endpoints).
+    - Enforces bearer auth on every other HTTP request when AUTH_TOKEN is set.
+    """
 
     def __init__(self, app, auth_token: Optional[str]):
         self.app = app
         self.auth_token = auth_token
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http" or not self.auth_token:
+        # Non-HTTP scopes (lifespan, websocket) go straight to FastMCP so that
+        # its anyio task group is initialised before requests arrive.
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope.get("headers", []))
-        auth_header = headers.get(b"authorization", b"").decode("latin1")
-        expected = f"Bearer {self.auth_token}"
+        path = scope.get("path", "")
+        method = scope.get("method", "")
 
-        if auth_header != expected:
-            response = JSONResponse(
-                {"detail": "Unauthorized"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        # ── Public OAuth endpoints ────────────────────────────────────────────
+        if path == "/authorize" and method == "GET":
+            request = Request(scope, receive)
+            response = await authorize(request)
             await response(scope, receive, send)
             return
+
+        if path == "/oauth/token" and method == "POST":
+            request = Request(scope, receive)
+            response = await oauth_token(request)
+            await response(scope, receive, send)
+            return
+
+        # ── Bearer auth for all MCP routes ───────────────────────────────────
+        if self.auth_token:
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"").decode("latin1")
+            if not secrets.compare_digest(auth_header, f"Bearer {self.auth_token}"):
+                response = JSONResponse(
+                    {"detail": "Unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+                return
 
         await self.app(scope, receive, send)
 
@@ -405,15 +427,9 @@ def main():
     uvicorn.run(app, host=host, port=port)
 
 
-# Export the Starlette/FastAPI app for testing and external use
-protected_mcp_app = BearerAuthMiddleware(mcp.streamable_http_app(), AUTH_TOKEN)
-app = Starlette(
-    routes=[
-        Route("/authorize", authorize, methods=["GET"]),
-        Route("/oauth/token", oauth_token, methods=["POST"]),
-        Mount("/", app=protected_mcp_app),
-    ]
-)
+# Wrap the FastMCP ASGI app so OAuth routes are public and MCP routes are
+# bearer-protected, while lifespan events reach FastMCP unobstructed.
+app = OAuthRouter(mcp.streamable_http_app(), AUTH_TOKEN)
 
 
 if __name__ == "__main__":
