@@ -604,6 +604,25 @@ async def lifespan(_app: Starlette):
 mcp.settings.streamable_http_path = "/"
 mcp.settings.sse_path = "/"
 
+
+class _NormalizeEmptyPath:
+    """ASGI wrapper: converts empty path '' to '/' after Mount prefix-stripping.
+
+    Starlette's Mount strips the mount prefix, leaving '' when the client
+    requests the bare mount path (e.g. GET /sse).  Most ASGI apps expect
+    at least a '/', so this wrapper normalises the empty string before
+    forwarding the scope to the inner app.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path", "") == "":
+            scope = {**scope, "path": "/"}
+        await self.app(scope, receive, send)
+
+
 app = Starlette(
     routes=[
         Route("/.well-known/oauth-authorization-server", oauth_authorization_server_metadata, methods=["GET"]),
@@ -613,8 +632,8 @@ app = Starlette(
         Route("/register", register_client, methods=["POST"]),
         Route("/authorize", authorize, methods=["GET"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
-        Mount("/mcp", app=mcp.streamable_http_app()),
-        Mount("/sse", app=mcp.sse_app()),
+        Mount("/mcp", app=_NormalizeEmptyPath(mcp.streamable_http_app())),
+        Mount("/sse", app=_NormalizeEmptyPath(mcp.sse_app())),
     ],
     lifespan=lifespan,
 )
