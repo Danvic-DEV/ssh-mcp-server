@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """SSH MCP Server - Simplified version for testing."""
 
+import base64
+import hashlib
 import os
 import re
-from typing import List, Dict, Any, Optional
+import secrets
+import time
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 import uvicorn
-from starlette.responses import JSONResponse
 from starlette.applications import Starlette
 from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 
 from mcp.server.fastmcp import FastMCP
@@ -28,6 +32,9 @@ DEFAULT_PORT = int(os.environ.get('SSH_PORT', '22'))
 AUTH_TOKEN = os.environ.get('AUTH_TOKEN')
 CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
+
+# In-memory store for pending PKCE authorization codes: {code: {..., expires_at}}
+_pending_codes: Dict[str, Dict[str, Any]] = {}
 
 
 class BearerAuthMiddleware:
@@ -58,13 +65,70 @@ class BearerAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-async def oauth_token(request: Request) -> JSONResponse:
-    """Issue bearer tokens using OAuth 2.0 client credentials."""
-    if not CLIENT_ID or not CLIENT_SECRET or not AUTH_TOKEN:
+def _purge_expired_codes() -> None:
+    """Remove expired authorization codes from the in-memory store."""
+    now = time.time()
+    expired = [code for code, data in _pending_codes.items() if data["expires_at"] < now]
+    for code in expired:
+        _pending_codes.pop(code, None)
+
+
+def _pkce_challenge(verifier: str) -> str:
+    """Compute the S256 code challenge for a given code verifier."""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+async def authorize(request: Request):
+    """OAuth 2.0 authorization endpoint (authorization code + PKCE)."""
+    params = request.query_params
+
+    client_id = params.get("client_id")
+    redirect_uri = params.get("redirect_uri")
+    state = params.get("state")
+    code_challenge = params.get("code_challenge")
+    code_challenge_method = params.get("code_challenge_method", "S256")
+
+    # Validate required parameters
+    missing = [p for p in ("client_id", "redirect_uri", "state", "code_challenge") if not params.get(p)]
+    if missing:
         return JSONResponse(
-            {"error": "server_misconfigured"},
-            status_code=503
+            {"error": "invalid_request", "error_description": f"Missing parameters: {', '.join(missing)}"},
+            status_code=400
         )
+
+    if code_challenge_method != "S256":
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Only code_challenge_method=S256 is supported"},
+            status_code=400
+        )
+
+    if not CLIENT_ID or client_id != CLIENT_ID:
+        return JSONResponse(
+            {"error": "unauthorized_client"},
+            status_code=401
+        )
+
+    # Generate a cryptographically secure authorization code
+    code = secrets.token_urlsafe(32)
+    _purge_expired_codes()
+    _pending_codes[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at": time.time() + 60,
+    }
+
+    separator = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{separator}code={code}&state={state}"
+    return RedirectResponse(url=location, status_code=302)
+
+
+async def oauth_token(request: Request) -> JSONResponse:
+    """OAuth 2.0 token endpoint — supports authorization_code (PKCE) and client_credentials."""
+    if not AUTH_TOKEN:
+        return JSONResponse({"error": "server_misconfigured"}, status_code=503)
 
     try:
         content_type = request.headers.get("content-type", "")
@@ -74,38 +138,75 @@ async def oauth_token(request: Request) -> JSONResponse:
             form_data = await request.form()
             payload = dict(form_data)
     except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    grant_type = payload.get("grant_type", "")
+    no_cache_headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+    # --- Authorization Code + PKCE grant ---
+    if grant_type == "authorization_code":
+        code = payload.get("code")
+        code_verifier = payload.get("code_verifier")
+        client_id = payload.get("client_id")
+        redirect_uri = payload.get("redirect_uri")
+
+        missing = [p for p in ("code", "code_verifier", "client_id", "redirect_uri") if not payload.get(p)]
+        if missing:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": f"Missing: {', '.join(missing)}"},
+                status_code=400
+            )
+
+        _purge_expired_codes()
+        record = _pending_codes.get(code)
+
+        if not record:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Unknown or expired code"}, status_code=400)
+
+        if time.time() > record["expires_at"]:
+            _pending_codes.pop(code, None)
+            return JSONResponse({"error": "invalid_grant", "error_description": "Authorization code expired"}, status_code=400)
+
+        if client_id != record["client_id"]:
+            return JSONResponse({"error": "invalid_client"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+
+        if redirect_uri != record["redirect_uri"]:
+            return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
+
+        if not secrets.compare_digest(_pkce_challenge(code_verifier), record["code_challenge"]):
+            return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+
+        # Code is single-use
+        _pending_codes.pop(code, None)
+
         return JSONResponse(
-            {"error": "invalid_request"},
-            status_code=400
+            {"access_token": AUTH_TOKEN, "token_type": "Bearer"},
+            headers=no_cache_headers
         )
 
-    client_id = payload.get("client_id")
-    client_secret = payload.get("client_secret")
-    grant_type = payload.get("grant_type")
+    # --- Client credentials grant (retained for backward compatibility) ---
+    if grant_type == "client_credentials" or grant_type == "":
+        if not CLIENT_ID or not CLIENT_SECRET:
+            return JSONResponse({"error": "server_misconfigured"}, status_code=503)
 
-    if grant_type and grant_type != "client_credentials":
+        client_id = payload.get("client_id")
+        client_secret = payload.get("client_secret")
+
+        id_ok = CLIENT_ID and secrets.compare_digest(client_id or "", CLIENT_ID)
+        secret_ok = CLIENT_SECRET and secrets.compare_digest(client_secret or "", CLIENT_SECRET)
+        if not id_ok or not secret_ok:
+            return JSONResponse(
+                {"error": "invalid_client"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+
         return JSONResponse(
-            {"error": "unsupported_grant_type"},
-            status_code=400
+            {"access_token": AUTH_TOKEN, "token_type": "Bearer"},
+            headers=no_cache_headers
         )
 
-    if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
-        return JSONResponse(
-            {"error": "invalid_client"},
-            status_code=401,
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-
-    return JSONResponse(
-        {
-            "access_token": AUTH_TOKEN,
-            "token_type": "Bearer"
-        },
-        headers={
-            "Cache-Control": "no-store",
-            "Pragma": "no-cache"
-        }
-    )
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
 def _handle_error(error: Exception, operation: str) -> str:
@@ -308,6 +409,7 @@ def main():
 protected_mcp_app = BearerAuthMiddleware(mcp.streamable_http_app(), AUTH_TOKEN)
 app = Starlette(
     routes=[
+        Route("/authorize", authorize, methods=["GET"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         Mount("/", app=protected_mcp_app),
     ]
