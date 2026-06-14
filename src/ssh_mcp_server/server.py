@@ -5,6 +5,8 @@ import os
 import re
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+import uvicorn
+from starlette.responses import JSONResponse
 
 from mcp.server.fastmcp import FastMCP
 from .ssh_client import SSHClient
@@ -20,6 +22,35 @@ DEFAULT_USER = os.environ.get('SSH_USER', 'root')
 DEFAULT_PASSWORD = os.environ.get('SSH_PASSWORD')
 DEFAULT_KEY_FILE = os.environ.get('SSH_KEY_FILE')
 DEFAULT_PORT = int(os.environ.get('SSH_PORT', '22'))
+AUTH_TOKEN = os.environ.get('AUTH_TOKEN')
+
+
+class BearerAuthMiddleware:
+    """Optional bearer auth middleware for all incoming HTTP requests."""
+
+    def __init__(self, app, auth_token: Optional[str]):
+        self.app = app
+        self.auth_token = auth_token
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not self.auth_token:
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        auth_header = headers.get(b"authorization", b"").decode("latin1")
+        expected = f"Bearer {self.auth_token}"
+
+        if auth_header != expected:
+            response = JSONResponse(
+                {"detail": "Unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
 
 
 def _handle_error(error: Exception, operation: str) -> str:
@@ -213,17 +244,13 @@ def execute_command(command: str, hostname: str, use_sudo: bool = False, sudo_pa
 
 def main():
     """Main function to run the SSH MCP server."""
-    # Configure FastMCP settings for streamable HTTP transport
-    mcp.settings.host = "0.0.0.0"
-    mcp.settings.port = 8000
-    mcp.settings.stateless_http = True  # Enable stateless mode
-    
-    # Run the MCP server with streamable HTTP transport
-    mcp.run(transport="streamable-http")
+    host = os.environ.get("SERVER_HOST", "0.0.0.0")
+    port = int(os.environ.get("SERVER_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)
 
 
 # Export the Starlette/FastAPI app for testing and external use
-app = mcp.streamable_http_app()
+app = BearerAuthMiddleware(mcp.streamable_http_app(), AUTH_TOKEN)
 
 
 if __name__ == "__main__":

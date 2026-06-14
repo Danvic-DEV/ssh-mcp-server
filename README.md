@@ -64,6 +64,7 @@ Add the following configuration to your `anythingllm_mcp_servers.json`:
 | `SSH_PASSWORD` | SSH password | - |
 | `SSH_KEY_FILE` | Path to SSH private key | `/app/ssh_keys/id_ed25519` |
 | `SSH_PORT` | SSH port | `22` |
+| `AUTH_TOKEN` | Optional bearer token for MCP HTTP auth | - |
 | `SERVER_HOST` | MCP server bind address | `0.0.0.0` |
 | `SERVER_PORT` | MCP server port | `8000` |
 
@@ -73,6 +74,14 @@ The server supports two authentication methods:
 
 1. **Password Authentication**: Set `SSH_PASSWORD` in your environment
 2. **Key-based Authentication**: By default, Docker uses `/app/ssh_keys/id_ed25519` (auto-generated on first run). You can still override `SSH_KEY_FILE` if needed.
+
+### MCP HTTP Authentication (Optional)
+
+Set `AUTH_TOKEN` to require bearer authentication on all incoming MCP HTTP requests.
+
+- Header required: `Authorization: Bearer <AUTH_TOKEN>`
+- Missing or incorrect token: HTTP `401 Unauthorized`
+- `AUTH_TOKEN` unset: authentication is disabled and requests are allowed through
 
 ## Usage
 
