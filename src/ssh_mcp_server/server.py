@@ -188,6 +188,21 @@ async def oauth_token(request: Request) -> JSONResponse:
     return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
+async def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
+    """Return OAuth 2.0 Authorization Server Metadata."""
+    base_url = str(request.base_url).rstrip("/")
+    metadata = {
+        "issuer": base_url,
+        "authorization_endpoint": f"{base_url}/authorize",
+        "token_endpoint": f"{base_url}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "client_credentials"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "code_challenge_methods_supported": ["S256"],
+    }
+    return JSONResponse(metadata)
+
+
 def _handle_error(error: Exception, operation: str) -> str:
     """Handle and format errors."""
     error_msg = str(error)
@@ -397,6 +412,7 @@ mcp.settings.sse_path = "/"
 
 app = Starlette(
     routes=[
+        Route("/.well-known/oauth-authorization-server", oauth_authorization_server_metadata, methods=["GET"]),
         Route("/authorize", authorize, methods=["GET"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         Mount("/mcp", app=mcp.streamable_http_app()),
