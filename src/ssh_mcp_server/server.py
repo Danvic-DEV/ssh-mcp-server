@@ -34,9 +34,13 @@ DEFAULT_PORT = int(os.environ.get('SSH_PORT', '22'))
 AUTH_TOKEN = os.environ.get('AUTH_TOKEN')
 CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
+DEFAULT_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 
 # In-memory store for pending PKCE authorization codes: {code: {..., expires_at}}
 _pending_codes: Dict[str, Dict[str, Any]] = {}
+
+# In-memory store for RFC 7591 dynamic client registrations.
+_registered_clients: Dict[str, Dict[str, Any]] = {}
 
 
 def _is_protected_transport_path(path: str) -> bool:
@@ -56,6 +60,37 @@ def _pkce_challenge(verifier: str) -> str:
     """Compute the S256 code challenge for a given code verifier."""
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _get_client(client_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a client record from dynamic registrations or static env config."""
+    if client_id in _registered_clients:
+        return _registered_clients[client_id]
+
+    if CLIENT_ID and client_id == CLIENT_ID:
+        return {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "redirect_uris": [DEFAULT_REDIRECT_URI],
+            "client_name": "static-env-client",
+            "client_id_issued_at": 0,
+            "client_secret_expires_at": 0,
+        }
+
+    return None
+
+
+def _validate_client_secret(client_id: str, client_secret: str) -> bool:
+    """Validate client credentials against registered or static clients."""
+    client = _get_client(client_id)
+    if not client:
+        return False
+
+    expected_secret = client.get("client_secret")
+    if not expected_secret:
+        return False
+
+    return secrets.compare_digest(client_secret or "", expected_secret)
 
 
 async def authorize(request: Request):
@@ -82,10 +117,17 @@ async def authorize(request: Request):
             status_code=400
         )
 
-    if not CLIENT_ID or client_id != CLIENT_ID:
+    client = _get_client(client_id or "")
+    if not client:
         return JSONResponse(
             {"error": "unauthorized_client"},
             status_code=401
+        )
+
+    if redirect_uri not in client.get("redirect_uris", []):
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri not registered for client"},
+            status_code=400,
         )
 
     # Generate a cryptographically secure authorization code
@@ -165,15 +207,13 @@ async def oauth_token(request: Request) -> JSONResponse:
 
     # --- Client credentials grant (retained for backward compatibility) ---
     if grant_type == "client_credentials" or grant_type == "":
-        if not CLIENT_ID or not CLIENT_SECRET:
+        if not CLIENT_ID and not _registered_clients:
             return JSONResponse({"error": "server_misconfigured"}, status_code=503)
 
         client_id = payload.get("client_id")
         client_secret = payload.get("client_secret")
 
-        id_ok = CLIENT_ID and secrets.compare_digest(client_id or "", CLIENT_ID)
-        secret_ok = CLIENT_SECRET and secrets.compare_digest(client_secret or "", CLIENT_SECRET)
-        if not id_ok or not secret_ok:
+        if not _validate_client_secret(client_id or "", client_secret or ""):
             return JSONResponse(
                 {"error": "invalid_client"},
                 status_code=401,
@@ -188,6 +228,49 @@ async def oauth_token(request: Request) -> JSONResponse:
     return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
+async def register_client(request: Request) -> JSONResponse:
+    """RFC 7591 Dynamic Client Registration endpoint."""
+    try:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            payload = await request.json()
+        else:
+            form_data = await request.form()
+            payload = dict(form_data)
+    except Exception:
+        return JSONResponse(
+            {"error": "invalid_client_metadata", "error_description": "Invalid registration payload"},
+            status_code=400,
+        )
+
+    redirect_uris = payload.get("redirect_uris")
+    if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(uri, str) for uri in redirect_uris):
+        return JSONResponse(
+            {"error": "invalid_redirect_uri", "error_description": "redirect_uris must be a non-empty array of strings"},
+            status_code=400,
+        )
+
+    client_id = f"client_{secrets.token_urlsafe(24)}"
+    client_secret = secrets.token_urlsafe(32)
+    issued_at = int(time.time())
+
+    client_record = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": issued_at,
+        "client_secret_expires_at": 0,
+        "redirect_uris": redirect_uris,
+        "client_name": payload.get("client_name"),
+        "token_endpoint_auth_method": payload.get("token_endpoint_auth_method", "client_secret_post"),
+        "grant_types": payload.get("grant_types", ["authorization_code"]),
+        "response_types": payload.get("response_types", ["code"]),
+    }
+
+    _registered_clients[client_id] = client_record
+
+    return JSONResponse(client_record, status_code=201)
+
+
 async def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
     """Return OAuth 2.0 Authorization Server Metadata."""
     base_url = str(request.base_url).rstrip("/")
@@ -195,6 +278,7 @@ async def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
         "issuer": base_url,
         "authorization_endpoint": f"{base_url}/authorize",
         "token_endpoint": f"{base_url}/oauth/token",
+        "registration_endpoint": f"{base_url}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "client_credentials"],
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
@@ -413,6 +497,7 @@ mcp.settings.sse_path = "/"
 app = Starlette(
     routes=[
         Route("/.well-known/oauth-authorization-server", oauth_authorization_server_metadata, methods=["GET"]),
+        Route("/register", register_client, methods=["POST"]),
         Route("/authorize", authorize, methods=["GET"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         Mount("/mcp", app=mcp.streamable_http_app()),
