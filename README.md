@@ -65,6 +65,8 @@ Add the following configuration to your `anythingllm_mcp_servers.json`:
 | `SSH_KEY_FILE` | Path to SSH private key | `/app/ssh_keys/id_ed25519` |
 | `SSH_PORT` | SSH port | `22` |
 | `AUTH_TOKEN` | Optional bearer token for MCP HTTP auth | - |
+| `CLIENT_ID` | OAuth client ID for `/oauth/token` | - |
+| `CLIENT_SECRET` | OAuth client secret for `/oauth/token` | - |
 | `SERVER_HOST` | MCP server bind address | `0.0.0.0` |
 | `SERVER_PORT` | MCP server port | `8000` |
 
@@ -82,6 +84,19 @@ Set `AUTH_TOKEN` to require bearer authentication on all incoming MCP HTTP reque
 - Header required: `Authorization: Bearer <AUTH_TOKEN>`
 - Missing or incorrect token: HTTP `401 Unauthorized`
 - `AUTH_TOKEN` unset: authentication is disabled and requests are allowed through
+
+### OAuth 2.0 Client Credentials
+
+The server exposes `POST /oauth/token` for client credentials token exchange.
+
+- Required env vars: `CLIENT_ID`, `CLIENT_SECRET`, and `AUTH_TOKEN`
+- Request body (`application/json` or form-encoded):
+  - `client_id`
+  - `client_secret`
+  - optional `grant_type=client_credentials`
+- Success response: bearer token payload with `access_token` equal to `AUTH_TOKEN`
+- Invalid credentials: HTTP `401` with `invalid_client`
+- Missing server config (`CLIENT_ID`, `CLIENT_SECRET`, or `AUTH_TOKEN`): HTTP `503`
 
 ## Usage
 

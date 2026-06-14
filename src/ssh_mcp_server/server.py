@@ -7,6 +7,9 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import uvicorn
 from starlette.responses import JSONResponse
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.routing import Mount, Route
 
 from mcp.server.fastmcp import FastMCP
 from .ssh_client import SSHClient
@@ -23,6 +26,8 @@ DEFAULT_PASSWORD = os.environ.get('SSH_PASSWORD')
 DEFAULT_KEY_FILE = os.environ.get('SSH_KEY_FILE')
 DEFAULT_PORT = int(os.environ.get('SSH_PORT', '22'))
 AUTH_TOKEN = os.environ.get('AUTH_TOKEN')
+CLIENT_ID = os.environ.get('CLIENT_ID')
+CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 
 
 class BearerAuthMiddleware:
@@ -51,6 +56,56 @@ class BearerAuthMiddleware:
             return
 
         await self.app(scope, receive, send)
+
+
+async def oauth_token(request: Request) -> JSONResponse:
+    """Issue bearer tokens using OAuth 2.0 client credentials."""
+    if not CLIENT_ID or not CLIENT_SECRET or not AUTH_TOKEN:
+        return JSONResponse(
+            {"error": "server_misconfigured"},
+            status_code=503
+        )
+
+    try:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            payload = await request.json()
+        else:
+            form_data = await request.form()
+            payload = dict(form_data)
+    except Exception:
+        return JSONResponse(
+            {"error": "invalid_request"},
+            status_code=400
+        )
+
+    client_id = payload.get("client_id")
+    client_secret = payload.get("client_secret")
+    grant_type = payload.get("grant_type")
+
+    if grant_type and grant_type != "client_credentials":
+        return JSONResponse(
+            {"error": "unsupported_grant_type"},
+            status_code=400
+        )
+
+    if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
+        return JSONResponse(
+            {"error": "invalid_client"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    return JSONResponse(
+        {
+            "access_token": AUTH_TOKEN,
+            "token_type": "Bearer"
+        },
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache"
+        }
+    )
 
 
 def _handle_error(error: Exception, operation: str) -> str:
@@ -250,7 +305,13 @@ def main():
 
 
 # Export the Starlette/FastAPI app for testing and external use
-app = BearerAuthMiddleware(mcp.streamable_http_app(), AUTH_TOKEN)
+protected_mcp_app = BearerAuthMiddleware(mcp.streamable_http_app(), AUTH_TOKEN)
+app = Starlette(
+    routes=[
+        Route("/oauth/token", oauth_token, methods=["POST"]),
+        Mount("/", app=protected_mcp_app),
+    ]
+)
 
 
 if __name__ == "__main__":

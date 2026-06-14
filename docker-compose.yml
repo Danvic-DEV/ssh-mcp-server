@@ -18,6 +18,8 @@ services:
       - SSH_KEY_FILE=${SSH_KEY_FILE:-/app/ssh_keys/id_ed25519}
       - SSH_PORT=${SSH_PORT:-22}
       - AUTH_TOKEN=${AUTH_TOKEN:-}
+      - CLIENT_ID=${CLIENT_ID:-}
+      - CLIENT_SECRET=${CLIENT_SECRET:-}
       # Server configuration
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
