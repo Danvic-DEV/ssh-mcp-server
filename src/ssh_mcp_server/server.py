@@ -287,6 +287,17 @@ async def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
     return JSONResponse(metadata)
 
 
+async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
+    """Return OAuth 2.0 Protected Resource Metadata (RFC 9728)."""
+    base_url = str(request.base_url).rstrip("/")
+    metadata = {
+        "resource": base_url,
+        "authorization_servers": [base_url],
+        "bearer_methods_supported": ["header"],
+    }
+    return JSONResponse(metadata)
+
+
 def _handle_error(error: Exception, operation: str) -> str:
     """Handle and format errors."""
     error_msg = str(error)
@@ -497,6 +508,7 @@ mcp.settings.sse_path = "/"
 app = Starlette(
     routes=[
         Route("/.well-known/oauth-authorization-server", oauth_authorization_server_metadata, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource_metadata, methods=["GET"]),
         Route("/register", register_client, methods=["POST"]),
         Route("/authorize", authorize, methods=["GET"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
