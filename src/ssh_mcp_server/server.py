@@ -4,6 +4,7 @@
 import base64
 from contextlib import asynccontextmanager
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -36,6 +37,7 @@ CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 SERVER_URL = os.environ.get('SERVER_URL')
 DEFAULT_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
+REGISTERED_CLIENTS_FILE = "/app/ssh_keys/registered_clients.json"
 
 # In-memory store for pending PKCE authorization codes: {code: {..., expires_at}}
 _pending_codes: Dict[str, Dict[str, Any]] = {}
@@ -93,6 +95,34 @@ def _resolve_base_url(request: Request) -> str:
         return f"https://{host}".rstrip("/")
 
     return str(request.base_url).rstrip("/")
+
+
+def _load_registered_clients() -> Dict[str, Dict[str, Any]]:
+    """Load registered OAuth clients from disk if available."""
+    if not os.path.exists(REGISTERED_CLIENTS_FILE):
+        return {}
+
+    try:
+        with open(REGISTERED_CLIENTS_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        # Fall back to empty registration set if file is unreadable/corrupt.
+        pass
+
+    return {}
+
+
+def _save_registered_clients() -> None:
+    """Persist registered OAuth clients to disk."""
+    os.makedirs(os.path.dirname(REGISTERED_CLIENTS_FILE), exist_ok=True)
+    temp_path = f"{REGISTERED_CLIENTS_FILE}.tmp"
+
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(_registered_clients, file, ensure_ascii=True, indent=2, sort_keys=True)
+
+    os.replace(temp_path, REGISTERED_CLIENTS_FILE)
 
 
 def _purge_expired_codes() -> None:
@@ -314,6 +344,7 @@ async def register_client(request: Request) -> JSONResponse:
     }
 
     _registered_clients[client_id] = client_record
+    _save_registered_clients()
 
     return JSONResponse(client_record, status_code=201)
 
@@ -544,6 +575,8 @@ def main():
 @asynccontextmanager
 async def lifespan(_app: Starlette):
     """Ensure FastMCP session manager is initialised for mounted transports."""
+    global _registered_clients
+    _registered_clients = _load_registered_clients()
     async with mcp.session_manager.run():
         yield
 
