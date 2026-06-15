@@ -556,7 +556,9 @@ def execute_command(command: str, hostname: str, use_sudo: bool = False, sudo_pa
         
         with SSHClient(hostname, user, pwd, key, port).connection() as client:
             if use_sudo:
-                exit_code, stdout, stderr = client.execute_sudo_command(command, sudo_password)
+                # Avoid double-sudo when clients send "sudo ..." with use_sudo=True.
+                normalized_command = re.sub(r"^\s*sudo\s+", "", command, flags=re.IGNORECASE)
+                exit_code, stdout, stderr = client.execute_sudo_command(normalized_command, sudo_password)
             else:
                 exit_code, stdout, stderr = client.execute_command(command)
             
